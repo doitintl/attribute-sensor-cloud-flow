@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# never commit credential samples used for verification
+*.key
+key.txt
+scratch/

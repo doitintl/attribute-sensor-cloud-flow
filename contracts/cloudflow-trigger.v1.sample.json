@@ -1,0 +1,86 @@
+{
+  "_comment": "Paste this verbatim as the Sample JSON in the CloudFlow webhook trigger. Every field a downstream node references MUST appear here -- CloudFlow derives the payload schema from this sample, and fields absent from it are invisible to filters, branches, and action nodes. Adding a field later means updating the sample and republishing. Values are representative, not real.",
+
+  "alert_id": "atr_01HZX3K5V8QG7YHN2M4P6R9TBC",
+  "idempotency_key": "atr_01HZX3K5V8QG7YHN2M4P6R9TBC:contain",
+  "contract_version": "1",
+
+  "detected_at": "2026-08-13T14:22:03Z",
+  "forwarded_at": "2026-08-13T14:22:05Z",
+  "severity": "critical",
+  "signal": "runaway_agent",
+  "reason": "42k requests in 5m from workload payments-agent, 61x baseline",
+
+  "provider": "bedrock",
+  "tier": 2,
+  "auto_apply": true,
+  "requires_approval": false,
+  "tier_rationale": "runaway_agent/critical -> tier 2",
+
+  "credential_kind": "bedrock_long_term_api_key",
+  "key_hint": "ABSK...[redacted:112]",
+
+  "aws_account_id": "123456789012",
+  "iam_user_name": "BedrockAPIKey-abcd",
+  "service_user_name": "BedrockAPIKey-abcd+1-at-123456789012",
+  "key_index": 1,
+  "access_key_id": "",
+  "service_specific_credential_id": "",
+  "region": "us-east-1",
+  "signing_service": "bedrock",
+
+  "workload_name": "payments-agent",
+  "principal_type": "non_human",
+  "observed_spend_usd": 4820.5,
+  "observed_window_minutes": 5,
+
+  "needs_external_lookup": true,
+  "is_actionable": true,
+
+  "primary_lookup_api": "iam:ListServiceSpecificCredentials",
+  "primary_lookup_params_json": "{\"UserName\":\"BedrockAPIKey-abcd\",\"ServiceName\":\"bedrock.amazonaws.com\"}",
+  "primary_lookup_select": "ServiceSpecificCredentials[?ServiceUserName=='BedrockAPIKey-abcd+1-at-123456789012'].ServiceSpecificCredentialId | [0]",
+
+  "primary_action_api": "iam:UpdateServiceSpecificCredential",
+  "primary_action_params_json": "{\"ServiceSpecificCredentialId\":\"${lookup.ServiceSpecificCredentialId}\",\"Status\":\"Inactive\"}",
+  "primary_action_reversible": true,
+  "primary_action_undo": "iam:UpdateServiceSpecificCredential(Status=Active)",
+
+  "quarantine_policy_arn": "arn:aws:iam::123456789012:policy/AttributeQuarantineBedrock",
+
+  "warnings_text": "trailing '+1' read as a key index; confirm against the ListServiceSpecificCredentials result",
+
+  "_flattening_note": "primary_* scalars and *_json strings exist because branch/filter nodes are far easier to wire against top-level scalars than against nested arrays. The full structures are below for the audit record.",
+
+  "lookups": [
+    {
+      "api": "iam:ListServiceSpecificCredentials",
+      "params_json": "{\"UserName\":\"BedrockAPIKey-abcd\",\"ServiceName\":\"bedrock.amazonaws.com\"}",
+      "select": "ServiceSpecificCredentials[?ServiceUserName=='BedrockAPIKey-abcd+1-at-123456789012'].ServiceSpecificCredentialId | [0]",
+      "note": "Match on the full ServiceUserName -- a user may hold a primary and a secondary key."
+    }
+  ],
+
+  "actions": [
+    {
+      "api": "iam:UpdateServiceSpecificCredential",
+      "params_json": "{\"ServiceSpecificCredentialId\":\"${lookup.ServiceSpecificCredentialId}\",\"Status\":\"Inactive\"}",
+      "tier": 2,
+      "reversible": true,
+      "undo": "iam:UpdateServiceSpecificCredential(Status=Active)",
+      "note": "Primary containment. IAM is eventually consistent -- re-list and assert Status==Inactive before recording as contained."
+    },
+    {
+      "api": "iam:AttachUserPolicy",
+      "params_json": "{\"UserName\":\"BedrockAPIKey-abcd\",\"PolicyArn\":\"arn:aws:iam::123456789012:policy/AttributeQuarantineBedrock\"}",
+      "tier": 2,
+      "reversible": true,
+      "undo": "iam:DetachUserPolicy",
+      "note": "Policy must deny both bedrock:CallWithBearerToken and bedrock-mantle:CallWithBearerToken."
+    }
+  ],
+
+  "warnings": [
+    "trailing '+1' read as a key index; confirm against the ListServiceSpecificCredentials result"
+  ]
+}

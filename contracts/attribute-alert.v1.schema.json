@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/doitintl/attribute-sensor-cloud-flow/contracts/attribute-alert.v1.schema.json",
+  "title": "Attribute enforcement alert (v1, inbound)",
+  "description": "What Attribute's alerting layer POSTs to the enforcement adapter. NOT what the adapter forwards to CloudFlow -- see cloudflow-trigger.v1.sample.json, which carries no secret material.",
+  "type": "object",
+  "required": ["alert_id", "detected_at", "severity", "signal", "provider"],
+  "additionalProperties": true,
+  "properties": {
+    "alert_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "description": "Stable Attribute-side alert identifier. Basis of the idempotency key."
+    },
+    "detected_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339. Used for staleness rejection."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["info", "warning", "critical"]
+    },
+    "signal": {
+      "type": "string",
+      "enum": [
+        "leaked_key",
+        "runaway_agent",
+        "token_spike",
+        "budget_overrun",
+        "anomalous_workload"
+      ],
+      "description": "Drives the containment tier. See adapter.policy.TIER_POLICY."
+    },
+    "reason": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "Human-readable justification. Lands in the audit record."
+    },
+    "provider": {
+      "type": "string",
+      "enum": ["bedrock", "openai", "anthropic", "gemini"],
+      "description": "Only 'bedrock' is implemented today; others are rejected."
+    },
+    "credential": {
+      "type": "string",
+      "description": "The credential as observed on the wire. SECRET -- the adapter resolves it, derives the identity, and discards it. Never forwarded to CloudFlow, never logged."
+    },
+    "key_hint": {
+      "type": "string",
+      "description": "Truncated/redacted credential. Used when 'credential' is absent; usually will not decode, which routes the alert to the CloudTrail fallback."
+    },
+    "workload_name": {
+      "type": "string",
+      "description": "Attribute workload that spent the tokens (zprobe -workload-name)."
+    },
+    "principal_type": {
+      "type": "string",
+      "enum": ["human", "non_human", "unknown"]
+    },
+    "observed_spend_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "observed_window_minutes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "requested_action": {
+      "type": "string",
+      "enum": ["observe", "contain"],
+      "description": "Advisory only, and can only LOWER the tier the adapter computes. Inbound payloads can never request destruction -- tier 3 is reachable only via human approval inside CloudFlow."
+    },
+    "sensor": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "host": { "type": "string" },
+        "workload_name": { "type": "string" },
+        "probe_version": { "type": "string" }
+      }
+    }
+  }
+}
