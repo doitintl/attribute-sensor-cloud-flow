@@ -105,12 +105,21 @@ Two smaller corrections from the same run:
   only at create time. Expected, and worth knowing: you cannot recover a key
   value from IAM later.
 
+### Primary/secondary disambiguation — verified
+
+A user may hold two Bedrock keys, and containing the wrong one leaves the leaked
+key live. Confirmed against two live keys on one user:
+
+| | Alias | `key_index` |
+|---|---|---|
+| Primary | `BedrockAPIKey-…-506dfe38-at-641260351119` | `null` |
+| Secondary | `BedrockAPIKey-…-506dfe38**+1**-at-641260351119` | `1` |
+
+With both present, each alias selects its own credential ID. The `+N` split is
+validated against real data.
+
 ### Still unverified
 
-- **Primary/secondary disambiguation.** A user may hold two Bedrock keys. If the
-  alias does not distinguish them, containment deactivates the wrong one and
-  leaves the leaked key live. `verify-against-aws.sh` now creates a second key
-  and asserts each alias selects its own credential ID — rerun it to close this.
 - **That the quarantine policy actually blocks calls.** Denying
   `bedrock:CallWithBearerToken` and `bedrock-mantle:CallWithBearerToken` is
   documented but untested here; it needs a real Bedrock invocation before and

@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM artifacts for Attribute -> CloudFlow Bedrock enforcement. Creates the
+  quarantine policy the flow attaches to a compromised identity, plus scoped
+  permission policies for the flow's containment (tier 2) and destruction
+  (tier 3) actions. Roles are created only if you supply a principal -- by
+  default this emits managed policies for you to attach to a role you control.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: AttributeEnforcement
+    Description: Prefix for created resource names.
+
+  CloudFlowPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN allowed to assume the containment roles (the CloudFlow AWS-node
+      principal). Leave empty to create policies only and attach them yourself.
+
+  ExternalId:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      sts:ExternalId required on assume. Strongly recommended when
+      CloudFlowPrincipalArn is a third party -- without it, principal
+      confusion is possible.
+
+  ProtectedIdentityArns:
+    Type: CommaDelimitedList
+    Default: "arn:aws:iam::000000000000:user/__placeholder__"
+    Description: >
+      IAM user/role ARNs the flow must never modify -- break-glass identities
+      and anything whose loss would be worse than the spend it is burning.
+      Enforced with an explicit Deny, which overrides every Allow.
+
+Conditions:
+  CreateRoles: !Not [!Equals [!Ref CloudFlowPrincipalArn, ""]]
+  HasExternalId: !Not [!Equals [!Ref ExternalId, ""]]
+
+Resources:
+  # --- the policy the flow ATTACHES to a compromised identity ---------------
+  #
+  # Denies Bedrock outright rather than only the bearer-token actions. Two
+  # distinct call paths reach Bedrock and a narrower deny misses one of them:
+  #
+  #   * API keys (ABSK)  -> bedrock:CallWithBearerToken, and separately
+  #                         bedrock-mantle:CallWithBearerToken. Denying only the
+  #                         first leaves the Mantle endpoint spending.
+  #   * SigV4 (AKIA/ASIA) -> InvokeModel / Converse etc. CallWithBearerToken
+  #                         does not apply at all, so a bearer-token-only deny
+  #                         does nothing against a leaked access key.
+  #
+  # A quarantine should stop the identity using Bedrock, full stop. Wildcards
+  # also survive new API surface being added later.
+  QuarantinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-QuarantineBedrock"
+      Description: >
+        Attached by the enforcement flow to contain a compromised Bedrock
+        credential. Reversible: detach to restore access.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyAllBedrockUse
+            Effect: Deny
+            Action:
+              - "bedrock:*"
+              - "bedrock-mantle:*"
+            Resource: "*"
+
+  # --- tier 2: reversible containment --------------------------------------
+  ContainmentPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-Containment"
+      Description: Tier 2 -- deactivate credentials and attach the quarantine policy.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ResolveIdentity
+            Effect: Allow
+            Action:
+              - iam:ListServiceSpecificCredentials
+              - iam:ListAccessKeys
+              - iam:GetUser
+              - iam:GetRole
+            Resource: "*"
+
+          # ListUsers has no resource-level scoping. Needed only for the
+          # AKIA -> owning-user enumeration; drop it once that map is cached.
+          - Sid: EnumerateUsersForAccessKeyLookup
+            Effect: Allow
+            Action:
+              - iam:ListUsers
+            Resource: "*"
+
+          - Sid: ResolveTemporaryCredentialIssuer
+            Effect: Allow
+            Action:
+              - cloudtrail:LookupEvents
+            Resource: "*"
+
+          - Sid: DeactivateCredentials
+            Effect: Allow
+            Action:
+              - iam:UpdateServiceSpecificCredential
+              - iam:UpdateAccessKey
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+
+          # The privilege-escalation guard. Unconditioned AttachUserPolicy lets
+          # anyone who can reach the webhook attach AdministratorAccess. The
+          # condition pins it to this one policy, so the worst a compromised
+          # trigger can do is deny Bedrock to somebody.
+          - Sid: AttachOnlyTheQuarantinePolicy
+            Effect: Allow
+            Action:
+              - iam:AttachUserPolicy
+              - iam:DetachUserPolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+            Resource:
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*"
+            Condition:
+              ArnEquals:
+                iam:PolicyARN: !Ref QuarantinePolicy
+
+          # Destruction lives in a separate role behind approval. Denying it
+          # here means a misconfigured flow cannot delete a credential even if
+          # somebody adds a delete action to the tier 2 path.
+          - Sid: NeverDestroy
+            Effect: Deny
+            Action:
+              - iam:DeleteServiceSpecificCredential
+              - iam:DeleteAccessKey
+              - iam:DeleteUser
+              - iam:DeleteRole
+            Resource: "*"
+
+          - Sid: NeverTouchProtectedIdentities
+            Effect: Deny
+            Action:
+              - iam:UpdateServiceSpecificCredential
+              - iam:UpdateAccessKey
+              - iam:AttachUserPolicy
+              - iam:AttachRolePolicy
+              - iam:PutUserPolicy
+              - iam:PutRolePolicy
+            Resource: !Ref ProtectedIdentityArns
+
+          # Stop the role editing its own permissions.
+          - Sid: NoSelfModification
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+            Resource:
+              - !Ref QuarantinePolicy
+              - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${NamePrefix}-*"
+
+  # --- tier 3: irreversible, approval-gated --------------------------------
+  DestructionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${NamePrefix}-Destruction"
+      Description: >
+        Tier 3 -- permanently delete a credential. Attach to a SEPARATE role the
+        flow assumes only behind human approval.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DeleteCredentials
+            Effect: Allow
+            Action:
+              - iam:DeleteServiceSpecificCredential
+              - iam:DeleteAccessKey
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:user/*"
+
+          - Sid: ReadForVerification
+            Effect: Allow
+            Action:
+              - iam:ListServiceSpecificCredentials
+              - iam:ListAccessKeys
+            Resource: "*"
+
+          - Sid: NeverTouchProtectedIdentities
+            Effect: Deny
+            Action:
+              - iam:DeleteServiceSpecificCredential
+              - iam:DeleteAccessKey
+            Resource: !Ref ProtectedIdentityArns
+
+  # --- optional roles ------------------------------------------------------
+  ContainmentRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: !Sub "${NamePrefix}-ContainmentRole"
+      Description: Assumed by the CloudFlow AWS node for tier 2 containment.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CloudFlowPrincipalArn
+            Action: sts:AssumeRole
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  sts:ExternalId: !Ref ExternalId
+              - !Ref AWS::NoValue
+      ManagedPolicyArns:
+        - !Ref ContainmentPolicy
+      Tags:
+        - Key: purpose
+          Value: attribute-enforcement-tier2
+
+  DestructionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      RoleName: !Sub "${NamePrefix}-DestructionRole"
+      Description: >
+        Assumed only behind human approval in CloudFlow. Separate from the
+        containment role so tier 3 cannot be reached by an automated path.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref CloudFlowPrincipalArn
+            Action: sts:AssumeRole
+            Condition: !If
+              - HasExternalId
+              - StringEquals:
+                  sts:ExternalId: !Ref ExternalId
+              - !Ref AWS::NoValue
+      ManagedPolicyArns:
+        - !Ref DestructionPolicy
+      Tags:
+        - Key: purpose
+          Value: attribute-enforcement-tier3
+
+Outputs:
+  QuarantinePolicyArn:
+    Description: Set this as QUARANTINE_POLICY_ARN on the adapter.
+    Value: !Ref QuarantinePolicy
+    Export:
+      Name: !Sub "${AWS::StackName}-QuarantinePolicyArn"
+
+  ContainmentPolicyArn:
+    Description: Attach to the role the CloudFlow AWS node assumes for tier 2.
+    Value: !Ref ContainmentPolicy
+
+  DestructionPolicyArn:
+    Description: Attach to a separate, approval-gated role for tier 3.
+    Value: !Ref DestructionPolicy
+
+  ContainmentRoleArn:
+    Condition: CreateRoles
+    Value: !GetAtt ContainmentRole.Arn
+
+  DestructionRoleArn:
+    Condition: CreateRoles
+    Value: !GetAtt DestructionRole.Arn
