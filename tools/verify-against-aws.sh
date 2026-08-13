@@ -50,12 +50,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$PROFILE" ]] || die "--profile is required"
 command -v aws >/dev/null     || die "aws CLI not found"
 command -v python3 >/dev/null || die "python3 not found"
 command -v jq >/dev/null      || die "jq not found (brew install jq)"
 
-AWS=(aws --profile "$PROFILE" --region "$REGION" --output json)
+# Without --profile, fall back to ambient credentials (env vars / default
+# profile). Lets a short-lived SSO role be used for one run without adding a
+# standing admin profile to ~/.aws/config.
+AWS=(aws --region "$REGION" --output json)
+[[ -n "$PROFILE" ]] && AWS=(aws --profile "$PROFILE" --region "$REGION" --output json)
 
 # --- cleanup -----------------------------------------------------------------
 
@@ -134,16 +137,23 @@ CRED_JSON="$("${AWS[@]}" iam create-service-specific-credential \
   || die "create-service-specific-credential failed -- does this account/role allow it?"
 
 CREATED_CRED_ID="$(jq -r '.ServiceSpecificCredential.ServiceSpecificCredentialId' <<<"$CRED_JSON")"
-IAM_SERVICE_USER="$(jq -r '.ServiceSpecificCredential.ServiceUserName // empty' <<<"$CRED_JSON")"
-# Field name differs by API version; try both.
-KEY_VALUE="$(jq -r '.ServiceSpecificCredential.ServiceApiKeyValue
+
+# Bedrock service-specific credentials return ServiceCredentialAlias /
+# ServiceCredentialSecret. The classic SSH/CodeCommit shape used
+# ServiceUserName / ServicePassword. Accept either.
+IAM_ALIAS="$(jq -r '.ServiceSpecificCredential.ServiceCredentialAlias
+                    // .ServiceSpecificCredential.ServiceUserName
+                    // empty' <<<"$CRED_JSON")"
+KEY_VALUE="$(jq -r '.ServiceSpecificCredential.ServiceCredentialSecret
+                    // .ServiceSpecificCredential.ServiceApiKeyValue
                     // .ServiceSpecificCredential.ServicePassword
                     // empty' <<<"$CRED_JSON")"
 
-[[ -n "$KEY_VALUE" ]] || die "no key value in the response; fields present: $(jq -r '.ServiceSpecificCredential | keys | join(", ")' <<<"$CRED_JSON")"
+info "create response fields: $(jq -r '.ServiceSpecificCredential | keys | join(", ")' <<<"$CRED_JSON")"
+[[ -n "$KEY_VALUE" ]] || die "no key value found in the create response"
 ok "credential id: $CREATED_CRED_ID"
-info "IAM reports ServiceUserName: ${IAM_SERVICE_USER:-(absent from create response)}"
-info "key value:   ${KEY_VALUE:0:4}...[redacted, ${#KEY_VALUE} chars]"
+info "alias reported by IAM: ${IAM_ALIAS:-(none)}"
+info "key value:             ${KEY_VALUE:0:4}...[redacted, ${#KEY_VALUE} chars]"
 
 # --- 3. run the resolver on the real key ------------------------------------
 
@@ -168,8 +178,20 @@ info "key_index:         $R_INDEX"
 step "Comparing resolver output against IAM"
 LIST_JSON="$("${AWS[@]}" iam list-service-specific-credentials \
   --user-name "$TEST_USER" --service-name bedrock.amazonaws.com)"
-ACTUAL_SERVICE_USER="$(jq -r --arg id "$CREATED_CRED_ID" \
-  '.ServiceSpecificCredentials[] | select(.ServiceSpecificCredentialId==$id) | .ServiceUserName' <<<"$LIST_JSON")"
+info "list response fields: $(jq -r '.ServiceSpecificCredentials[0] | keys | join(", ")' <<<"$LIST_JSON")"
+
+# Whichever of the two field names this API version uses is the join key the
+# flow's lookup must filter on.
+ALIAS_FIELD="$(jq -r '.ServiceSpecificCredentials[0]
+  | if has("ServiceCredentialAlias") then "ServiceCredentialAlias"
+    elif has("ServiceUserName") then "ServiceUserName"
+    else "" end' <<<"$LIST_JSON")"
+[[ -n "$ALIAS_FIELD" ]] || die "list response has neither ServiceCredentialAlias nor ServiceUserName"
+info "join key field:       $ALIAS_FIELD"
+
+ACTUAL_SERVICE_USER="$(jq -r --arg id "$CREATED_CRED_ID" --arg f "$ALIAS_FIELD" \
+  '.ServiceSpecificCredentials[] | select(.ServiceSpecificCredentialId==$id) | .[$f]' <<<"$LIST_JSON")"
+info "join key value:       $ACTUAL_SERVICE_USER"
 
 [[ "$R_KIND" == "bedrock_long_term_api_key" ]] \
   && ok "classified as a long-term Bedrock API key" \
@@ -192,12 +214,78 @@ else
   info "     ^ the lookup filter would match nothing; fix _split_service_user_name"
 fi
 
+# Check the resolver emits a lookup filtering on the field IAM actually returns.
+R_SELECT="$(jq -r '.lookups[0].select // ""' <<<"$RESOLVED")"
+if [[ "$R_SELECT" == *"$ALIAS_FIELD"* ]]; then
+  ok "the resolver's lookup filters on $ALIAS_FIELD"
+else
+  bad "the resolver's lookup does not reference $ALIAS_FIELD"
+  info "     select: $R_SELECT"
+  info "     ^ filtering on a field IAM does not return matches nothing, so"
+  info "       containment would report success while doing nothing"
+fi
+
 # Resolve the credential id the way the flow would, and check it is the right one.
-SELECTED="$(jq -r --arg sun "$R_SERVICE_USER" \
-  '.ServiceSpecificCredentials[] | select(.ServiceUserName==$sun) | .ServiceSpecificCredentialId' <<<"$LIST_JSON")"
+SELECTED="$(jq -r --arg sun "$R_SERVICE_USER" --arg f "$ALIAS_FIELD" \
+  '.ServiceSpecificCredentials[] | select(.[$f]==$sun) | .ServiceSpecificCredentialId' <<<"$LIST_JSON")"
 [[ "$SELECTED" == "$CREATED_CRED_ID" ]] \
   && ok "the flow's lookup selects the correct credential id" \
   || bad "lookup selected '$SELECTED', expected '$CREATED_CRED_ID'"
+
+# --- 4b. two keys on one user: does the join key pick the right one? ---------
+#
+# The dangerous case. A user may hold a primary and a secondary Bedrock key. If
+# the alias does not disambiguate them, containment deactivates the wrong key --
+# leaving the leaked one live while the audit log says the incident is closed.
+
+step "Creating a SECOND key on the same user (disambiguation test)"
+CRED2_JSON="$("${AWS[@]}" iam create-service-specific-credential \
+  --user-name "$TEST_USER" --service-name bedrock.amazonaws.com 2>&1)" || CRED2_JSON=""
+
+if [[ -z "$CRED2_JSON" || "$CRED2_JSON" != *ServiceSpecificCredentialId* ]]; then
+  info "could not create a second key (quota or policy); skipping"
+  info "the primary/secondary disambiguation path remains unverified"
+else
+  CRED2_ID="$(jq -r '.ServiceSpecificCredential.ServiceSpecificCredentialId' <<<"$CRED2_JSON")"
+  CRED2_ALIAS="$(jq -r '.ServiceSpecificCredential.ServiceCredentialAlias // empty' <<<"$CRED2_JSON")"
+  CRED2_KEY="$(jq -r '.ServiceSpecificCredential.ServiceCredentialSecret // empty' <<<"$CRED2_JSON")"
+  info "second credential id: $CRED2_ID"
+  info "second alias:         $CRED2_ALIAS"
+
+  [[ "$CRED2_ALIAS" != "$ACTUAL_SERVICE_USER" ]] \
+    && ok "the two keys have distinct aliases" \
+    || bad "both keys share the alias '$CRED2_ALIAS' -- they cannot be told apart"
+
+  R2="$(cd "$REPO_ROOT" && printf '%s' "$CRED2_KEY" | python3 -m resolver.cli --stdin 2>&1 | tail -n +2)"
+  R2_ALIAS="$(jq -r .service_user_name <<<"$R2")"
+  R2_USER="$(jq -r .iam_user_name <<<"$R2")"
+  R2_INDEX="$(jq -r .key_index <<<"$R2")"
+  info "resolver on key 2 -> alias=$R2_ALIAS user=$R2_USER index=$R2_INDEX"
+
+  [[ "$R2_ALIAS" == "$CRED2_ALIAS" ]] \
+    && ok "resolver reads the second key's alias correctly" \
+    || bad "resolver said '$R2_ALIAS', IAM says '$CRED2_ALIAS'"
+
+  [[ "$R2_USER" == "$TEST_USER" ]] \
+    && ok "second key still resolves to the right IAM user" \
+    || bad "second key resolved to user '$R2_USER', expected '$TEST_USER'"
+
+  # The decisive check: each key's alias must select its OWN credential id.
+  LIST2_JSON="$("${AWS[@]}" iam list-service-specific-credentials \
+    --user-name "$TEST_USER" --service-name bedrock.amazonaws.com)"
+  PICK1="$(jq -r --arg a "$R_SERVICE_USER" --arg f "$ALIAS_FIELD" \
+    '.ServiceSpecificCredentials[] | select(.[$f]==$a) | .ServiceSpecificCredentialId' <<<"$LIST2_JSON")"
+  PICK2="$(jq -r --arg a "$R2_ALIAS" --arg f "$ALIAS_FIELD" \
+    '.ServiceSpecificCredentials[] | select(.[$f]==$a) | .ServiceSpecificCredentialId' <<<"$LIST2_JSON")"
+
+  [[ "$PICK1" == "$CREATED_CRED_ID" && "$PICK2" == "$CRED2_ID" ]] \
+    && ok "with two keys present, each alias selects its own credential id" \
+    || bad "disambiguation failed: key1 -> '$PICK1' (want $CREATED_CRED_ID), key2 -> '$PICK2' (want $CRED2_ID)"
+
+  info "deleting the second key"
+  "${AWS[@]}" iam delete-service-specific-credential \
+    --user-name "$TEST_USER" --service-specific-credential-id "$CRED2_ID" >/dev/null 2>&1 || true
+fi
 
 # --- 5. containment ----------------------------------------------------------
 

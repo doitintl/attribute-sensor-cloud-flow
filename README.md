@@ -136,12 +136,19 @@ deterministically from the credential alone.
 
 ## Verification status
 
-The IAM and Bedrock **API** behaviour is from AWS documentation. The **`ABSK` key
-layout** is from
-[Wiz's teardown](https://www.wiz.io/blog/a-new-type-of-long-lived-key-on-aws-bedrock-api-keys),
-not a live sample — tests depending on it are tagged
-`UNVERIFIED_AGAINST_REAL_KEY`. Confirm against a throwaway key on a sandbox
-account before this touches anything real; see
+The Bedrock resolver is **verified against a real key** (account 641260351119,
+2026-08-13) — key layout, IAM user and account extraction, the credential-ID
+lookup, and reversible deactivation all confirmed by
+`tools/verify-against-aws.sh`.
+
+That run caught a defect no unit test could: Bedrock credentials expose
+**`ServiceCredentialAlias`**, not `ServiceUserName`. The resolver had been
+emitting a lookup filtering on the latter, and a JMESPath filter on an absent
+field matches nothing *silently* — the flow would have written "contained" to
+the audit log while the key kept spending.
+
+Still unverified: primary/secondary key disambiguation, that the quarantine
+policy actually blocks calls, and the `AKIA`/`ASIA` paths. See
 [`resolver/README.md`](resolver/README.md).
 
 **Open dependency:** whether Attribute's webhook can send a custom

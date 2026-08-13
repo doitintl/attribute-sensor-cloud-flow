@@ -72,25 +72,55 @@ invariants are asserted in the tests.
 
 ## Verification status
 
-Everything about the IAM and Bedrock **APIs** is from AWS documentation:
-[revoking Bedrock keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys-revoke.html),
-`UpdateServiceSpecificCredential`, `UpdateAccessKey`.
+**Verified against a real key** — account 641260351119, 2026-08-13, via
+`tools/verify-against-aws.sh`. All checks passed:
 
-The **`ABSK` key layout** is from
-[Wiz's teardown](https://www.wiz.io/blog/a-new-type-of-long-lived-key-on-aws-bedrock-api-keys),
-not a live sample. Tests depending on it are tagged
-`UNVERIFIED_AGAINST_REAL_KEY`. Confirm by minting a throwaway key on a sandbox
-account and running `python3 -m resolver.cli`, checking that:
+| Confirmed | Value |
+|---|---|
+| `ABSK` prefix, base64 payload decoding to `<alias>:<secret>` | ✅ |
+| Alias embeds IAM user + account | `BedrockAPIKey-…-at-641260351119` |
+| `iam_user_name` matches the real IAM `UserName` | ✅ |
+| Resolver's alias matches IAM **exactly** (the join key) | ✅ |
+| The flow's lookup selects the correct credential ID | ✅ |
+| Credential ID prefix | `ACCA…` |
+| `UpdateServiceSpecificCredential` → `Inactive`, then back to `Active` | ✅ reversible |
 
-1. The decoded ServiceUserName matches `ServiceUserName` in
-   `aws iam list-service-specific-credentials --service-name bedrock.amazonaws.com`
-   **exactly** — that string is the join key.
-2. `iam_user_name` matches the real `UserName`, i.e. the `+N` split is right.
-3. Key length is not assumed anywhere (the published 132 chars is not hardcoded).
+### What the live run corrected
 
-Deliberately **not** assumed: total key length, that the IAM user is always
-named `BedrockAPIKey-*` (keys can be minted for existing users), or that `+N`
-absence means primary.
+The create/list responses carry **`ServiceCredentialAlias`** and
+**`ServiceCredentialSecret`** — there is **no `ServiceUserName` field** on
+Bedrock credentials. The resolver originally emitted a lookup filtering on
+`ServiceUserName`; a JMESPath filter on an absent field matches nothing
+*silently*, so containment would have reported success while the key kept
+spending. The emitted filter now tries `ServiceCredentialAlias` first and falls
+back to `ServiceUserName` for the legacy SSH/CodeCommit shape.
+
+Two smaller corrections from the same run:
+
+- The real key was **156 characters**, not the 132 in the published teardown.
+  Nothing assumes a length, which is why this was a non-event.
+- A **primary** key's alias carries **no `+N`** (`key_index` is `null`).
+  The `+N` suffix appears only on a secondary key.
+- The **list** response omits `ServiceCredentialSecret` — the secret is returned
+  only at create time. Expected, and worth knowing: you cannot recover a key
+  value from IAM later.
+
+### Still unverified
+
+- **Primary/secondary disambiguation.** A user may hold two Bedrock keys. If the
+  alias does not distinguish them, containment deactivates the wrong one and
+  leaves the leaked key live. `verify-against-aws.sh` now creates a second key
+  and asserts each alias selects its own credential ID — rerun it to close this.
+- **That the quarantine policy actually blocks calls.** Denying
+  `bedrock:CallWithBearerToken` and `bedrock-mantle:CallWithBearerToken` is
+  documented but untested here; it needs a real Bedrock invocation before and
+  after attaching the policy.
+- **The `AKIA` and `ASIA` paths**, which depend on enumeration and CloudTrail
+  rather than on the credential itself.
+
+Deliberately **not** assumed anywhere: total key length, that the IAM user is
+always named `BedrockAPIKey-*` (keys can be minted for existing users), or that
+absence of `+N` means primary.
 
 ## Secret handling
 

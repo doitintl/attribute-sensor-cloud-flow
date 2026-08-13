@@ -80,9 +80,21 @@ class LongTermApiKeyTests(unittest.TestCase):
         self.assertEqual(lookup.api, "iam:ListServiceSpecificCredentials")
         self.assertEqual(lookup.params["UserName"], "BedrockAPIKey-abcd")
         self.assertEqual(lookup.params["ServiceName"], "bedrock.amazonaws.com")
-        # Matching the whole ServiceUserName is what disambiguates primary from
-        # secondary when one user holds both keys.
+        # Matching the whole alias is what disambiguates primary from secondary
+        # when one user holds both keys.
         self.assertIn(service_user_name, lookup.select)
+
+    def test_lookup_filters_on_the_field_iam_actually_returns(self) -> None:
+        # Verified against a live key (account 641260351119, 2026-08-13): Bedrock
+        # credentials expose ServiceCredentialAlias, NOT ServiceUserName. A
+        # filter on an absent field matches nothing, so containment would report
+        # success while doing nothing -- the worst possible failure mode.
+        result = resolve(make_absk("BedrockAPIKey-abcd-at-123456789012"), policy_arn=POLICY_ARN)
+        select = result.lookups[0].select
+
+        self.assertIn("ServiceCredentialAlias", select)
+        self.assertIn("ServiceUserName", select)  # legacy shape still accepted
+        self.assertIn("ServiceSpecificCredentialId", select)
 
     def test_tier_two_action_is_reversible_deactivation(self) -> None:
         result = resolve(make_absk("BedrockAPIKey-abcd-at-123456789012"), policy_arn=POLICY_ARN)

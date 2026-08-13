@@ -59,6 +59,17 @@ BEDROCK_API_KEY_PREFIX = "ABSK"
 #: IAM's service name for Bedrock service-specific credentials.
 BEDROCK_IAM_SERVICE_NAME = "bedrock.amazonaws.com"
 
+#: Field on a ListServiceSpecificCredentials record that carries the credential's
+#: public name -- the join key between an observed key and its credential ID.
+#:
+#: Bedrock credentials return ``ServiceCredentialAlias``; the older SSH/CodeCommit
+#: shape used ``ServiceUserName``. Verified against a live key in account
+#: 641260351119 on 2026-08-13: the create and list responses carry
+#: ``ServiceCredentialAlias`` and ``ServiceCredentialSecret``, and no
+#: ``ServiceUserName`` at all. Filtering on the wrong name matches nothing, so
+#: the emitted JMESPath falls back across both.
+CREDENTIAL_ALIAS_FIELDS = ("ServiceCredentialAlias", "ServiceUserName")
+
 #: SigV4 credential-scope service names that indicate Bedrock traffic. Both
 #: endpoints must be contained -- denying only ``bedrock`` leaves Mantle open.
 BEDROCK_SIGNING_SERVICES = frozenset({"bedrock", "bedrock-mantle"})
@@ -242,6 +253,18 @@ def _b64decode_strict(payload: str) -> bytes:
         ) from exc
 
 
+def _alias_select(alias: str) -> str:
+    """JMESPath selecting the credential ID whose alias matches ``alias``.
+
+    Tries every known alias field name, because the field differs between the
+    Bedrock shape and the legacy one and a filter on an absent field silently
+    matches nothing -- which would make containment report success while doing
+    nothing at all.
+    """
+    clauses = " || ".join(f"{field}=='{alias}'" for field in CREDENTIAL_ALIAS_FIELDS)
+    return f"ServiceSpecificCredentials[?{clauses}].ServiceSpecificCredentialId | [0]"
+
+
 def _split_service_user_name(
     service_user_name: str,
 ) -> tuple[str | None, int | None, str | None, list[str]]:
@@ -348,13 +371,12 @@ def _resolve_bedrock_api_key(credential: str, *, policy_arn: str) -> ResolvedCre
                     "UserName": iam_user_name,
                     "ServiceName": BEDROCK_IAM_SERVICE_NAME,
                 },
-                select=(
-                    "ServiceSpecificCredentials[?ServiceUserName=="
-                    f"'{service_user_name}'].ServiceSpecificCredentialId | [0]"
-                ),
+                select=_alias_select(service_user_name),
                 note=(
-                    "Match on the full ServiceUserName rather than the parsed IAM "
-                    "user name -- a user may hold a primary and a secondary key."
+                    "Match on the full credential alias rather than the parsed "
+                    "IAM user name -- a user may hold a primary and a secondary "
+                    "key. Bedrock returns this as ServiceCredentialAlias; the "
+                    "filter also accepts the legacy ServiceUserName."
                 ),
             ),
         )
