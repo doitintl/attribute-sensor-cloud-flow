@@ -10,8 +10,38 @@ The EKS control plane bills **~$0.10/hr (~$73/mo)** whether or not anything
 runs on it, plus ~$0.02/hr for the t3.small node — about **$0.12/hr, $88/mo**.
 It does not idle down. Run `./eks/teardown.sh` when you are done.
 
+**Stay on a standard-support Kubernetes version.** Once a version reaches
+extended support AWS bills the cluster at **$0.60/hr instead of $0.10/hr** —
+six times the cost, for an idle test cluster. This bit us: the cluster was
+first built on 1.31, which had already left standard support, and ran at
+~$0.62/hr until it was rebuilt on 1.36. Check before pinning a version:
+
+```bash
+aws eks describe-cluster-versions --region us-east-1
+```
+
 Bedrock spend during tests is negligible: `nova-micro` at 64 max tokens is
 fractions of a cent per request.
+
+## Upgrading
+
+EKS upgrades one minor version at a time, so a cluster several versions behind
+takes hours of sequential control-plane upgrades — all billed at the extended
+support rate if that is why you are upgrading.
+
+For this cluster, **rebuilding is faster and cheaper than upgrading**. Nothing
+here is precious: the IAM users and Bedrock keys live in IAM and survive, and
+the only in-cluster state is six Secrets and a ConfigMap.
+
+```bash
+eksctl delete cluster --name attribute-bedrock-test --region us-east-1 --wait
+eksctl create cluster -f eks/cluster.yaml
+kubectl apply -f eks/load-generator.yaml
+./eks/provision-keys.sh --profile attrb-admin
+```
+
+`provision-keys.sh` rotates each user's key rather than creating duplicates, so
+re-running it after a rebuild is safe.
 
 ## Setup
 

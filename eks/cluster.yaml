@@ -9,10 +9,18 @@
 #     privileged DaemonSet -- Fargate gives no node-level access, so it cannot
 #     run there at all.
 #
-#   * One t3.small. Note this caps the node at 11 pods (ENI limit): roughly
-#     4 for kube-system, 1 for the Attribute DaemonSet, leaving ~6. That is
-#     exactly why load runs as on-demand Jobs rather than always-on
-#     Deployments -- the cluster sits idle until you fire a test.
+#   * One t3.small, with VPC CNI prefix delegation so the node is not capped at
+#     11 pods. The default ENI limit left only ~5 free slots after kube-system,
+#     and the Attribute install filled every one of them with retrying hook
+#     pods. Prefix delegation plus maxPodsPerNode lifts that ceiling.
+#
+#     Memory, not pod count, is now the binding constraint: ~1.5Gi allocatable
+#     against the Attribute sensor's 300Mi request / 1Gi limit plus six load
+#     pods. If pods start getting evicted, lower sensorresources.memory.limit
+#     in the Attribute values before reaching for a bigger instance.
+#
+#   * Load still runs as on-demand Jobs, not always-on Deployments, so the
+#     cluster sits idle between tests.
 #
 #   * No IRSA for Bedrock. The workloads authenticate with Bedrock API keys
 #     passed as bearer tokens, which is the whole point: those are the
@@ -24,7 +32,11 @@ kind: ClusterConfig
 metadata:
   name: attribute-bedrock-test
   region: us-east-1
-  version: "1.31"
+  # Keep this on a STANDARD_SUPPORT version. Extended-support clusters bill at
+  # $0.60/hr instead of $0.10/hr -- six times the cost for an idle test cluster.
+  # Check before pinning:
+  #   aws eks describe-cluster-versions --region us-east-1
+  version: "1.36"
   tags:
     project: attribute-sensor-cloud-flow
     purpose: bedrock-enforcement-test
@@ -32,6 +44,13 @@ metadata:
 
 iam:
   withOIDC: true
+
+addons:
+  - name: vpc-cni
+    configurationValues: |-
+      env:
+        ENABLE_PREFIX_DELEGATION: "true"
+        WARM_PREFIX_TARGET: "1"
 
 managedNodeGroups:
   - name: workers
@@ -41,6 +60,9 @@ managedNodeGroups:
     maxSize: 2
     volumeSize: 20
     amiFamily: AmazonLinux2023
+    # Needs the prefix-delegation addon config above; without it the ENI limit
+    # caps this at 11 regardless of what is set here.
+    maxPodsPerNode: 30
     labels:
       role: bedrock-load
     tags:
