@@ -36,8 +36,8 @@ the only in-cluster state is six Secrets and a ConfigMap.
 ```bash
 eksctl delete cluster --name attribute-bedrock-test --region us-east-1 --wait
 eksctl create cluster -f eks/cluster.yaml
-kubectl apply -f eks/load-generator.yaml
 ./eks/provision-keys.sh --profile attrb-admin
+kubectl apply -f eks/load-generator.yaml
 ```
 
 `provision-keys.sh` rotates each user's key rather than creating duplicates, so
@@ -47,9 +47,12 @@ re-running it after a rebuild is safe.
 
 ```bash
 aws eks update-kubeconfig --name attribute-bedrock-test --region us-east-1 --profile attrb-admin
-kubectl apply -f eks/load-generator.yaml
 ./eks/provision-keys.sh --profile attrb-admin
+kubectl apply -f eks/load-generator.yaml
 ```
+
+Order matters: `provision-keys.sh` creates the `bedrock-load` namespace, so
+applying the ConfigMap first fails on a fresh cluster.
 
 That mints six IAM users, one Bedrock key each, and loads them into the cluster
 as Secrets. Key values are never printed or written to disk — IAM returns a key
