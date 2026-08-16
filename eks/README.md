@@ -89,15 +89,52 @@ through the node role and the test would prove nothing.
 `python:3.12-alpine` plus a ConfigMap covers it — no SigV4, no SDK, no Docker,
 no ECR.
 
-## The Attribute sensor is not installed here
+## Installing the Attribute sensor
 
-`attributesensor.sh` is a **systemd** installer for a VM — it writes
-`/etc/systemd/system/zprobe.service`. It will not work on EKS, which needs
-Attribute's DaemonSet or Helm chart plus a workload token. Get those from the
-Attribute team and install into this cluster; everything else here is ready.
+`attributesensor.sh` is a **systemd** installer for a VM and will not work on
+EKS. The cluster install is the Helm chart:
 
-Until then the cluster generates real, attributable Bedrock traffic — it just
-is not being observed by Attribute yet.
+```bash
+cp eks/attribute-values.example.yaml eks/attribute-values.yaml
+# paste the token from Attribute into eks/attribute-values.yaml
+helm install attribute oci://quay.io/attribute/operator-chart \
+  -f eks/attribute-values.yaml -n attribute --create-namespace
+```
+
+`eks/attribute-values.yaml` is **gitignored** — it carries a live organization
+token. Only the sanitised example belongs in the repo.
+
+### Blocked: 401 registering this AWS account
+
+The install currently fails. The `attrb-pre-install-hook` Job correctly detects
+EKS, then calls Attribute's registration API and is rejected:
+
+```
+Getting sensor token
+  url=https://sensor.app.attrb.io/api/v1/register/aws/641260351119/attribute-bedrock-test
+Failed to get sensor token: 401 Unauthorized ()
+```
+
+The token is **valid and unexpired** — the 401 is authorisation, not expiry.
+Registration is keyed on the **AWS account ID**, and the supplied token
+(`values-doit-fe-payer.yaml`) appears scoped to the DoiT FE payer, not to the
+playground account 641260351119.
+
+Resolving it needs Attribute to either issue a token valid for 641260351119 or
+onboard that account. Nothing in this repo can work around it.
+
+Two operational notes while it is failing:
+
+- **The failed hook Job retries and each attempt leaves a pod behind.** On a
+  t3.small that filled all 11 pod slots in minutes and blocked everything else.
+  Clean up with `helm uninstall attribute -n attribute` and
+  `kubectl delete namespace attribute` before doing anything else.
+- **The init container prints the full token in its pod logs.** Anyone with
+  `kubectl logs` on that namespace can read an organization credential. Worth
+  raising with Attribute.
+
+Until this is resolved the cluster still generates real, attributable Bedrock
+traffic — it is simply not being observed yet.
 
 ## Teardown
 

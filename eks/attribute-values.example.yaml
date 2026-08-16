@@ -1,0 +1,48 @@
+# Attribute sensor values -- TEMPLATE. Copy, add your token, do not commit.
+#
+#   cp eks/attribute-values.example.yaml eks/attribute-values.yaml
+#   # paste your token into eks/attribute-values.yaml
+#   helm install attribute oci://quay.io/attribute/operator-chart \
+#     -f eks/attribute-values.yaml -n attribute --create-namespace
+#
+# eks/attribute-values.yaml is gitignored. The token is an ORGANIZATION
+# credential (`is_organization: true` in its payload) and is short-lived --
+# roughly seven days. If the sensor stops reporting, check the token expiry
+# before debugging anything else.
+#
+# A separate namespace matters for RBAC isolation; --create-namespace handles it.
+
+# Operator resources.
+resources:
+  limits:
+    cpu: 100m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+token: REPLACE_ME
+
+initconfig:
+  create_secret: true
+
+daemonset:
+  enabled: true
+
+# The eBPF sensor runs per node. On a small node these requests matter: 300Mi
+# request against a t3.small's ~1.5Gi allocatable is a meaningful slice, and
+# the 1Gi limit can squeeze load pods under memory pressure. Lower them, or use
+# a larger instance, if pods start getting evicted.
+sensorresources:
+  cpu:
+    request: "100m"
+    limit: "200m"
+  memory:
+    request: "300Mi"
+    limit: "1Gi"
+
+# Java instrumentation -- irrelevant to this scenario, whose workloads are
+# Python making plain HTTPS calls. Left at the values supplied by Attribute.
+sensorDisableAutoJavaInstrumentation: true
+javaAutoInject:
+  enabled: true

@@ -10,3 +10,10 @@ venv/
 *.key
 key.txt
 scratch/
+
+# Attribute sensor values carry a live organization token -- keep them out of
+# git. Commit eks/attribute-values.example.yaml instead.
+values-*.yaml
+*values*doit*.yaml
+eks/attribute-values.yaml
+!eks/attribute-values.example.yaml
