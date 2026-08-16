@@ -1,0 +1,56 @@
+# Test cluster for the Attribute -> CloudFlow Bedrock enforcement scenario.
+#
+# Six Bedrock API keys drive load from inside the cluster; Attribute's sensor
+# attributes spend per key; crossing a threshold fires the enforcement flow.
+#
+# Deliberate choices:
+#
+#   * EC2 managed nodes, NOT Fargate. Attribute's sensor is eBPF and runs as a
+#     privileged DaemonSet -- Fargate gives no node-level access, so it cannot
+#     run there at all.
+#
+#   * One t3.small. Note this caps the node at 11 pods (ENI limit): roughly
+#     4 for kube-system, 1 for the Attribute DaemonSet, leaving ~6. That is
+#     exactly why load runs as on-demand Jobs rather than always-on
+#     Deployments -- the cluster sits idle until you fire a test.
+#
+#   * No IRSA for Bedrock. The workloads authenticate with Bedrock API keys
+#     passed as bearer tokens, which is the whole point: those are the
+#     long-lived credentials the enforcement flow revokes. Giving the nodes
+#     Bedrock IAM permissions would mask whether key revocation actually works.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: attribute-bedrock-test
+  region: us-east-1
+  version: "1.31"
+  tags:
+    project: attribute-sensor-cloud-flow
+    purpose: bedrock-enforcement-test
+    delete-after: on-demand
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: workers
+    instanceType: t3.small
+    desiredCapacity: 1
+    minSize: 1
+    maxSize: 2
+    volumeSize: 20
+    amiFamily: AmazonLinux2023
+    labels:
+      role: bedrock-load
+    tags:
+      project: attribute-sensor-cloud-flow
+    # The node role gets no Bedrock permissions on purpose -- see above.
+    iam:
+      withAddonPolicies:
+        cloudWatch: true
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: ["audit", "authenticator"]
+    logRetentionInDays: 7

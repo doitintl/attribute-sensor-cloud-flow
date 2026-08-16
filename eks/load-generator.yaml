@@ -1,0 +1,168 @@
+# Load generator script, mounted into Jobs created by eks/generate-load.sh.
+#
+# Pure stdlib Python: Bedrock API keys are bearer tokens, so no SigV4, no SDK,
+# no image build, no ECR. A stock python image plus this ConfigMap is the whole
+# workload.
+#
+# The generator is written to make ENFORCEMENT VISIBLE. When the flow disables a
+# key mid-run, it prints the exact request where 200 turned into 403 and how
+# long the key survived after the threshold -- that number is the point of the
+# whole demo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bedrock-load-script
+  namespace: bedrock-load
+  labels:
+    app.kubernetes.io/part-of: attribute-bedrock-test
+data:
+  load.py: |
+    """Drive Bedrock traffic with one API key and report when it stops working."""
+    from __future__ import annotations
+
+    import json
+    import os
+    import sys
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
+    KEY = os.environ["BEDROCK_API_KEY"]
+    WORKLOAD = os.environ.get("WORKLOAD_NAME", "unknown")
+    REGION = os.environ.get("AWS_REGION", "us-east-1")
+    MODEL = os.environ.get("MODEL_ID", "amazon.nova-micro-v1:0")
+    REQUESTS = int(os.environ.get("REQUESTS", "100"))
+    CONCURRENCY = int(os.environ.get("CONCURRENCY", "4"))
+    MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "64"))
+    DELAY_MS = int(os.environ.get("DELAY_MS", "0"))
+
+    URL = f"https://bedrock-runtime.{REGION}.amazonaws.com/model/{MODEL}/invoke"
+
+    PROMPT = (
+        "Summarise the following support ticket in two sentences: customer "
+        "reports intermittent checkout failures during peak hours, suspects "
+        "payment gateway timeouts, has already cleared cache and retried."
+    )
+
+    lock = threading.Lock()
+    state = {
+        "ok": 0,
+        "failed": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "codes": {},
+        "first_denial_at": None,   # request number where the key stopped working
+        "first_denial_time": None,
+        "last_success_time": None,
+        "started": time.time(),
+    }
+
+
+    def record_denial(n: int) -> None:
+        """First 4xx after at least one success is the containment landing."""
+        if state["first_denial_at"] is None and state["ok"] > 0:
+            state["first_denial_at"] = n
+            state["first_denial_time"] = time.time()
+            elapsed = state["first_denial_time"] - state["started"]
+            print(
+                f"\n  *** KEY STOPPED WORKING at request {n} "
+                f"({elapsed:.1f}s into the run) ***",
+                flush=True,
+            )
+
+
+    def one(n: int) -> None:
+        if DELAY_MS:
+            time.sleep(DELAY_MS / 1000.0)
+
+        body = json.dumps({
+            "messages": [{"role": "user", "content": [{"text": f"{PROMPT} (request {n})"}]}],
+            "inferenceConfig": {"maxTokens": MAX_TOKENS},
+        }).encode()
+
+        req = urllib.request.Request(
+            URL,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read())
+            usage = payload.get("usage", {})
+            with lock:
+                state["ok"] += 1
+                state["input_tokens"] += usage.get("inputTokens", 0)
+                state["output_tokens"] += usage.get("outputTokens", 0)
+                state["codes"][resp.status] = state["codes"].get(resp.status, 0) + 1
+                state["last_success_time"] = time.time()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:160]
+            with lock:
+                state["failed"] += 1
+                state["codes"][exc.code] = state["codes"].get(exc.code, 0) + 1
+                if exc.code in (403, 400, 401):
+                    record_denial(n)
+            if state["failed"] <= 3 or exc.code in (403, 401):
+                print(f"  req {n}: HTTP {exc.code} {detail}", flush=True)
+        except Exception as exc:  # network, timeout, DNS
+            with lock:
+                state["failed"] += 1
+                state["codes"]["error"] = state["codes"].get("error", 0) + 1
+            if state["failed"] <= 3:
+                print(f"  req {n}: {type(exc).__name__}: {exc}", flush=True)
+
+
+    def main() -> int:
+        print(
+            f"workload={WORKLOAD} model={MODEL} region={REGION}\n"
+            f"requests={REQUESTS} concurrency={CONCURRENCY} max_tokens={MAX_TOKENS}\n"
+            f"key={KEY[:4]}...[{len(KEY)} chars]\n",
+            flush=True,
+        )
+
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            for i, _ in enumerate(pool.map(one, range(1, REQUESTS + 1)), start=1):
+                if i % 25 == 0:
+                    with lock:
+                        print(
+                            f"  {i}/{REQUESTS}  ok={state['ok']} failed={state['failed']} "
+                            f"tokens={state['input_tokens'] + state['output_tokens']}",
+                            flush=True,
+                        )
+
+        elapsed = time.time() - state["started"]
+        total_tokens = state["input_tokens"] + state["output_tokens"]
+        print(f"\n{'=' * 60}")
+        print(f"workload:        {WORKLOAD}")
+        print(f"duration:        {elapsed:.1f}s")
+        print(f"succeeded:       {state['ok']}")
+        print(f"failed:          {state['failed']}")
+        print(f"tokens in/out:   {state['input_tokens']} / {state['output_tokens']}  (total {total_tokens})")
+        print(f"status codes:    {dict(state['codes'])}")
+        if state["ok"]:
+            print(f"throughput:      {state['ok'] / elapsed:.1f} successful req/s")
+
+        if state["first_denial_at"] is not None:
+            survived = state["first_denial_time"] - state["started"]
+            print(f"\nCONTAINMENT OBSERVED")
+            print(f"  key served {state['first_denial_at'] - 1} requests, then began failing")
+            print(f"  it stayed usable for {survived:.1f}s after this run started")
+            print(f"  that window is the money and exposure the flow did not prevent")
+        elif state["failed"] == 0:
+            print(f"\nkey worked for every request -- no containment during this run")
+        print(f"{'=' * 60}", flush=True)
+
+        # Exit 0 even when the key was revoked: containment is the expected
+        # outcome of the scenario, not a failure of the job.
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(main())
