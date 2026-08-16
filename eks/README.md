@@ -137,24 +137,47 @@ helm install attribute oci://quay.io/attribute/operator-chart \
 `eks/attribute-values.yaml` is **gitignored** — it carries a live organization
 token. Only the sanitised example belongs in the repo.
 
-### Blocked: 401 registering this AWS account
+### Blocked: registration fails server-side
 
-The install currently fails. The `attrb-pre-install-hook` Job correctly detects
-EKS, then calls Attribute's registration API and is rejected:
+The install fails. The `attrb-pre-install-hook` Job detects EKS correctly, then
+calls Attribute's registration API and gets an error:
 
 ```
 Getting sensor token
   url=https://sensor.app.attrb.io/api/v1/register/aws/641260351119/attribute-bedrock-test
-Failed to get sensor token: 401 Unauthorized ()
+Failed to get sensor token: 500 Internal Server Error ()
 ```
 
-The token is **valid and unexpired** — the 401 is authorisation, not expiry.
-Registration is keyed on the **AWS account ID**, and the supplied token
-(`values-doit-fe-payer.yaml`) appears scoped to the DoiT FE payer, not to the
-playground account 641260351119.
+Two tokens have been tried against account 641260351119:
 
-Resolving it needs Attribute to either issue a token valid for 641260351119 or
-onboard that account. Nothing in this repo can work around it.
+| Token | Shape | Result |
+|---|---|---|
+| First (7-day) | EdDSA, `client_id` + `is_organization` | **401** |
+| Second (365-day) | ES256, `iss: dashboard`, `sub`, `jti` | **500** |
+
+The second token is confirmed reaching the API — the init container logs show
+it using the ES256 token, and the failure reproduces with plain `curl`, no
+Kubernetes involved:
+
+```bash
+curl -i "https://sensor.app.attrb.io/api/v1/register/aws/641260351119/attribute-bedrock-test" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Endpoint behaviour observed while narrowing this down:
+
+| Authorization | Response |
+|---|---|
+| *(none)* | 401 |
+| malformed string | 500 |
+| the ES256 token | 500 |
+
+A 500 for a malformed token is itself a bug — it should be 401 or 400 — and it
+makes "is my token wrong?" impossible to answer from the response alone.
+
+This needs Attribute to investigate server-side. The token's `jti`
+(`26d610cc-d0c7-4556-bde6-2ed5e9d608c1`) is the handle for tracing it in their
+logs. Chart `operator-chart:0.0.97`, init image `sensor-k8s-init:1.0.14`.
 
 Two operational notes while it is failing:
 
