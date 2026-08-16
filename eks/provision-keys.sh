@@ -95,19 +95,47 @@ kubectl get nodes >/dev/null 2>&1 \
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 ok "namespace $NAMESPACE ready"
 
-# Least privilege: invoke only, and only the two cheap models the load
-# generator uses. A leaked key from this cluster cannot reach anything else.
+# Least privilege, in two statements because the two actions behave differently.
+#
+# CallWithBearerToken is the gate on *using an API key at all* and does NOT
+# support resource-level scoping -- restricting it to a foundation-model ARN
+# denies every call with:
+#
+#   not authorized to perform: bedrock:CallWithBearerToken on resource: *
+#
+# InvokeModel is the action that does take a model ARN, so that is where the
+# cheap-models-only restriction actually binds. A key leaking out of this
+# cluster still cannot reach anything but nova-micro and nova-lite.
+#
+# This is the same split the quarantine policy relies on in reverse: denying
+# InvokeModel alone would not stop an API key, and denying CallWithBearerToken
+# alone would not stop a SigV4 caller.
 INVOKE_POLICY=$(cat <<'JSON'
 {
   "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["bedrock:InvokeModel", "bedrock:CallWithBearerToken", "bedrock-mantle:CallWithBearerToken"],
-    "Resource": [
-      "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0",
-      "arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0"
-    ]
-  }]
+  "Statement": [
+    {
+      "Sid": "BearerTokenGate",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:CallWithBearerToken",
+        "bedrock-mantle:CallWithBearerToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InvokeCheapModelsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0",
+        "arn:aws:bedrock:*::foundation-model/amazon.nova-lite-v1:0"
+      ]
+    }
+  ]
 }
 JSON
 )

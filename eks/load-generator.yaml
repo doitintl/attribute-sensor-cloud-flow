@@ -46,6 +46,13 @@ data:
         "payment gateway timeouts, has already cleared cache and retried."
     )
 
+    # A single 403 does not mean the key was revoked. Freshly created IAM
+    # credentials commonly deny for a few seconds before propagating, and a lone
+    # transient error would otherwise be reported as containment -- exactly the
+    # false positive that would discredit a live demo. Require a sustained run
+    # of denials with no success after it.
+    DENIAL_STREAK_FOR_CONTAINMENT = 3
+
     lock = threading.Lock()
     state = {
         "ok": 0,
@@ -53,24 +60,46 @@ data:
         "input_tokens": 0,
         "output_tokens": 0,
         "codes": {},
-        "first_denial_at": None,   # request number where the key stopped working
-        "first_denial_time": None,
+        "denials": 0,
+        "consecutive_denials": 0,
+        "streak_started_at": None,
+        "streak_started_time": None,
+        "contained_at": None,       # request number where denial became sustained
+        "contained_time": None,
         "last_success_time": None,
         "started": time.time(),
     }
 
 
     def record_denial(n: int) -> None:
-        """First 4xx after at least one success is the containment landing."""
-        if state["first_denial_at"] is None and state["ok"] > 0:
-            state["first_denial_at"] = n
-            state["first_denial_time"] = time.time()
-            elapsed = state["first_denial_time"] - state["started"]
+        """Track consecutive denials; announce only once the run is sustained."""
+        state["denials"] += 1
+        state["consecutive_denials"] += 1
+        if state["consecutive_denials"] == 1:
+            state["streak_started_at"] = n
+            state["streak_started_time"] = time.time()
+
+        if (
+            state["contained_at"] is None
+            and state["ok"] > 0
+            and state["consecutive_denials"] >= DENIAL_STREAK_FOR_CONTAINMENT
+        ):
+            state["contained_at"] = state["streak_started_at"]
+            state["contained_time"] = state["streak_started_time"]
+            elapsed = state["contained_time"] - state["started"]
             print(
-                f"\n  *** KEY STOPPED WORKING at request {n} "
-                f"({elapsed:.1f}s into the run) ***",
+                f"\n  *** KEY STOPPED WORKING around request "
+                f"{state['streak_started_at']} ({elapsed:.1f}s into the run) ***",
                 flush=True,
             )
+
+
+    def record_success() -> None:
+        """A success breaks the streak -- and retracts a premature verdict."""
+        state["consecutive_denials"] = 0
+        state["streak_started_at"] = None
+        state["contained_at"] = None
+        state["contained_time"] = None
 
 
     def one(n: int) -> None:
@@ -102,6 +131,7 @@ data:
                 state["output_tokens"] += usage.get("outputTokens", 0)
                 state["codes"][resp.status] = state["codes"].get(resp.status, 0) + 1
                 state["last_success_time"] = time.time()
+                record_success()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:160]
             with lock:
@@ -149,12 +179,19 @@ data:
         if state["ok"]:
             print(f"throughput:      {state['ok'] / elapsed:.1f} successful req/s")
 
-        if state["first_denial_at"] is not None:
-            survived = state["first_denial_time"] - state["started"]
+        if state["contained_at"] is not None:
+            survived = state["contained_time"] - state["started"]
             print(f"\nCONTAINMENT OBSERVED")
-            print(f"  key served {state['first_denial_at'] - 1} requests, then began failing")
+            print(f"  key served ~{state['contained_at'] - 1} requests, then stopped working")
             print(f"  it stayed usable for {survived:.1f}s after this run started")
             print(f"  that window is the money and exposure the flow did not prevent")
+        elif state["denials"] > 0:
+            # Denials that never became a sustained run: propagation lag or
+            # throttling, not revocation. Saying so avoids a false positive.
+            print(
+                f"\n{state['denials']} transient denial(s), but the key kept working "
+                f"-- not containment (likely IAM propagation or throttling)"
+            )
         elif state["failed"] == 0:
             print(f"\nkey worked for every request -- no containment during this run")
         print(f"{'=' * 60}", flush=True)
