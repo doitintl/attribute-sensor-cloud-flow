@@ -95,11 +95,17 @@ data:
 
 
     def record_success() -> None:
-        """A success breaks the streak -- and retracts a premature verdict."""
+        """A success breaks the current streak.
+
+        It does NOT retract an announced verdict. Under concurrency, requests
+        complete out of order, so a request issued before the key was revoked
+        can land after several denials -- retracting on that would erase a real
+        containment. Whether the run *ended* contained is decided in main()
+        from the final streak, once every in-flight request has settled.
+        """
         state["consecutive_denials"] = 0
         state["streak_started_at"] = None
-        state["contained_at"] = None
-        state["contained_time"] = None
+        state["last_success_time"] = time.time()
 
 
     def one(n: int) -> None:
@@ -179,12 +185,21 @@ data:
         if state["ok"]:
             print(f"throughput:      {state['ok'] / elapsed:.1f} successful req/s")
 
-        if state["contained_at"] is not None:
-            survived = state["contained_time"] - state["started"]
+        # Decide from the FINAL state, now that every in-flight request has
+        # settled: a run that ends in a sustained denial streak was contained.
+        ended_contained = state["consecutive_denials"] >= DENIAL_STREAK_FOR_CONTAINMENT
+
+        if ended_contained or state["contained_at"] is not None:
+            at = state["contained_at"] or state["streak_started_at"]
+            when = state["contained_time"] or state["streak_started_time"]
+            survived = (when or state["started"]) - state["started"]
             print(f"\nCONTAINMENT OBSERVED")
-            print(f"  key served ~{state['contained_at'] - 1} requests, then stopped working")
+            print(f"  key served {state['ok']} requests, then stopped working")
+            print(f"  first sustained denial around request {at}")
             print(f"  it stayed usable for {survived:.1f}s after this run started")
-            print(f"  that window is the money and exposure the flow did not prevent")
+            print(f"  {state['denials']} request(s) were refused after revocation")
+            if not ended_contained:
+                print(f"  NOTE: run did not end in denial -- verify the key's real status")
         elif state["denials"] > 0:
             # Denials that never became a sustained run: propagation lag or
             # throttling, not revocation. Saying so avoids a false positive.
